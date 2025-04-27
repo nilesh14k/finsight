@@ -1,9 +1,11 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List
 import yfinance as yf
 from apscheduler.schedulers.background import BackgroundScheduler
+import asyncio
+import requests
 
 app = FastAPI()
 
@@ -15,7 +17,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Models ---
 class PriceResponse(BaseModel):
     symbol: str
     price: float
@@ -39,34 +40,37 @@ class MovingAverageResponse(BaseModel):
 
 class Alert(BaseModel):
     symbol: str
-    condition: str  # "above" or "below"
+    condition: str
     target_price: float
     triggered: bool = False
 
-# In-memory storage for alerts
 alerts_db: List[Alert] = []
 
-# --- Endpoints ---
 @app.get("/", summary="Root endpoint")
 def read_root():
     return {"message": "Welcome to FinSight API 🚀"}
 
-@app.get("/price", response_model=PriceResponse, summary="Get current price for a symbol")
-def get_current_price(symbol: str):
-    ticker = yf.Ticker(symbol)
-    data = ticker.history(period="2d")
+@app.get("/price", response_model=PriceResponse)
+def get_current_price(
+    symbol: str = Query(..., min_length=1, description="Ticker symbol, e.g. AAPL")
+):
+    symbol = symbol.strip().upper()
+    try:
+        ticker = yf.Ticker(symbol)
+        data = ticker.history(period="2d")
+    except ValueError:
+        raise HTTPException(400, "Invalid symbol")
     if data.empty or len(data) < 2:
-        raise HTTPException(status_code=404, detail="Symbol not found or insufficient data")
+        raise HTTPException(404, "Symbol not found or insufficient data")
     last_two = data.tail(2)
-    current = last_two.iloc[-1]
-    prev = last_two.iloc[-2]
+    current, prev = last_two.iloc[-1], last_two.iloc[-2]
     return PriceResponse(
-        symbol=symbol.upper(),
+        symbol=symbol,
         price=current["Close"],
         day_high=current["High"],
         day_low=current["Low"],
         prev_close=prev["Close"],
-        timestamp=str(current.name)
+        timestamp=str(current.name),
     )
 
 @app.get("/history", response_model=List[HistoricalDataPoint], summary="Get historical price data")
@@ -109,24 +113,58 @@ def create_alert(alert: Alert):
 def list_alerts():
     return alerts_db
 
-# --- Background job to check alerts ---
-
+@app.websocket("/ws/price/{symbol}")
+async def websocket_price(websocket: WebSocket, symbol: str):
+    await websocket.accept()
+    ticker = yf.Ticker(symbol)
+    try:
+        while True:
+            data = ticker.history(period="1d").tail(1).iloc[-1]
+            payload = {
+                "price": data["Close"],
+                "high": data["High"],
+                "low": data["Low"],
+                "timestamp": str(data.name)
+            }
+            await websocket.send_json(payload)
+            await asyncio.sleep(5)
+    except WebSocketDisconnect:
+        pass
 def check_alerts():
     print("[AlertChecker] Checking alerts...")
     for alert in alerts_db:
         if alert.triggered:
             continue
+
         ticker = yf.Ticker(alert.symbol)
         data = ticker.history(period="1d")
         if data.empty:
             continue
-        last_close = data["Close"].iloc[-1]
-        if (alert.condition == "above" and last_close > alert.target_price) or \
-           (alert.condition == "below" and last_close < alert.target_price):
-            alert.triggered = True
-            print(f"✅ ALERT: {alert.symbol} {'>' if alert.condition=='above' else '<'} {alert.target_price} (current {last_close})!")
 
-# Start background scheduler
+        last_close = data["Close"].iloc[-1]
+        triggered = (
+            (alert.condition == "above" and last_close > alert.target_price) or
+            (alert.condition == "below" and last_close < alert.target_price)
+        )
+
+        if triggered:
+            alert.triggered = True
+            msg = (
+                f"{alert.symbol} is now "
+                f"{'above' if alert.condition=='above' else 'below'} "
+                f"${alert.target_price:.2f} (current ${last_close:.2f})"
+            )
+            print(f"✅ ALERT: {msg}")
+
+            try:
+                requests.post(
+                    "http://localhost:3000/api/push/send",
+                    json={"title": f"{alert.symbol} Alert 🚨", "body": msg},
+                    timeout=5
+                )
+            except Exception as e:
+                print("❌ Push notification failed:", e)
+
 scheduler = BackgroundScheduler()
 scheduler.add_job(check_alerts, "interval", seconds=30, id="alert_checker")
 scheduler.start()
