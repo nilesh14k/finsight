@@ -1,11 +1,17 @@
+import os
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from urllib.parse import urlparse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 import yfinance as yf
 from apscheduler.schedulers.background import BackgroundScheduler
 import asyncio
 import requests
+from datetime import datetime
+
+load_dotenv()
 
 app = FastAPI()
 
@@ -17,64 +23,267 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+#
+# --- Models ---
+#
+
+class TrendingTicker(BaseModel):
+    symbol:    str
+    name:      Optional[str]
+    logo_url:  Optional[str]
+    price:     Optional[float]
+
 class PriceResponse(BaseModel):
-    symbol: str
-    price: float
-    day_high: float
-    day_low: float
-    prev_close: float
-    timestamp: str
+    symbol:        str
+    name:          Optional[str]
+    price:         float
+    day_high:      float
+    day_low:       float
+    prev_close:    float
+    timestamp:     str
+    logo_url:      Optional[str]
+    currency:      Optional[str]
+
+    market_cap:        Optional[float]
+    fifty_two_wk_high: Optional[float]
+    fifty_two_wk_low:  Optional[float]
+    volume:            Optional[int]
+    avg_volume:        Optional[int]
+    trailing_pe:       Optional[float]
+    forward_pe:        Optional[float]
+    eps:               Optional[float]
+    dividend_yield:    Optional[float]
+    next_earnings:     Optional[str]
+    ex_dividend_date:  Optional[str]
+    sector:            Optional[str]
+    industry:          Optional[str]
+    country:           Optional[str]
+    website:           Optional[str]
 
 class HistoricalDataPoint(BaseModel):
-    date: str
-    open: float
-    high: float
-    low: float
-    close: float
+    date:   str
+    open:   float
+    high:   float
+    low:    float
+    close:  float
     volume: int
 
 class MovingAverageResponse(BaseModel):
-    symbol: str
-    period: int
+    symbol:         str
+    period:         int
     moving_average: float
 
 class Alert(BaseModel):
-    symbol: str
-    condition: str
+    symbol:       str
+    condition:    str
     target_price: float
-    triggered: bool = False
+    triggered:    bool = False
+
+class ExchangeConfig(BaseModel):
+    region:   str   # e.g. "US" or "IN"
+    timezone: str   # IANA tz database name
+    open:     str   # "HH:MM"
+    close:    str   # "HH:MM"
+
+#
+# --- In-memory stores & config ---
+#
 
 alerts_db: List[Alert] = []
+
+EXCHANGE_HOURS = {
+    "US": ExchangeConfig(
+        region="US",
+        timezone="America/New_York",
+        open="09:30",
+        close="16:00",
+    ),
+    "IN": ExchangeConfig(
+        region="IN",
+        timezone="Asia/Kolkata",
+        open="09:15",
+        close="15:30",
+    ),
+    # add more regions here if needed
+}
+
+# Financial Modeling Prep fallback setup
+FMP_API_KEY = os.getenv("FMP_API_KEY")
+if not FMP_API_KEY:
+    raise RuntimeError("Please set FMP_API_KEY in your environment")
+
+# map your region codes to FMP exchange codes
+FMP_EXCHANGE = {
+    "US": "NASDAQ",
+    "IN": "BSE",    # or "NSE"
+    "GB": "LSE",
+    # add other region→exchange mappings as needed
+}
+
+#
+# --- Endpoints ---
+#
 
 @app.get("/", summary="Root endpoint")
 def read_root():
     return {"message": "Welcome to FinSight API 🚀"}
 
-@app.get("/price", response_model=PriceResponse)
-def get_current_price(
-    symbol: str = Query(..., min_length=1, description="Ticker symbol, e.g. AAPL")
-):
-    symbol = symbol.strip().upper()
-    try:
-        ticker = yf.Ticker(symbol)
-        data = ticker.history(period="2d")
-    except ValueError:
-        raise HTTPException(400, "Invalid symbol")
-    if data.empty or len(data) < 2:
-        raise HTTPException(404, "Symbol not found or insufficient data")
-    last_two = data.tail(2)
-    current, prev = last_two.iloc[-1], last_two.iloc[-2]
-    return PriceResponse(
-        symbol=symbol,
-        price=current["Close"],
-        day_high=current["High"],
-        day_low=current["Low"],
-        prev_close=prev["Close"],
-        timestamp=str(current.name),
+@app.get("/exchange-config", response_model=ExchangeConfig, summary="Get exchange hours & timezone")
+def get_exchange_config(region: str = Query("US", min_length=2, max_length=3)):
+    cfg = EXCHANGE_HOURS.get(region.upper())
+    if not cfg:
+        raise HTTPException(404, f"No exchange config for region '{region}'")
+    return cfg
+
+@app.get("/price", response_model=PriceResponse, summary="Get current price + metadata")
+def get_current_price(symbol: str = Query(..., min_length=1)):
+    sym = symbol.strip().upper()
+    ticker = yf.Ticker(sym)
+    info = ticker.info or {}
+    name = info.get("longName") or info.get("shortName")
+    logo = info.get("logo_url")
+    if not logo:
+        site = info.get("website") or ""
+        domain = urlparse(site).netloc
+        if domain:
+            logo = f"https://logo.clearbit.com/{domain}"
+
+    raw_earn = info.get("earningsTimestamp")
+    next_earnings = (
+        datetime.fromtimestamp(raw_earn).isoformat()
+        if isinstance(raw_earn, (int, float))
+        else None
+    )
+    raw_ex = info.get("exDividendDate")
+    ex_dividend_date = (
+        datetime.fromtimestamp(raw_ex).date().isoformat()
+        if isinstance(raw_ex, (int, float))
+        else None
     )
 
-@app.get("/history", response_model=List[HistoricalDataPoint], summary="Get historical price data")
-def get_historical_data(symbol: str, range: str = Query("1mo", description="Data range, e.g. 1d, 5d, 1mo, 1y")):
+    data = ticker.history(period="2d")
+    if data.empty or len(data) < 2:
+        raise HTTPException(404, "Symbol not found or insufficient data")
+    cur, prev = data.tail(2).iloc[-1], data.tail(2).iloc[-2]
+
+    return PriceResponse(
+        symbol=sym,
+        name=name,
+        price=cur["Close"],
+        day_high=cur["High"],
+        day_low=cur["Low"],
+        prev_close=prev["Close"],
+        timestamp=str(cur.name),
+        logo_url=logo,
+        currency=info.get("currency"),
+        market_cap=info.get("marketCap"),
+        fifty_two_wk_high=info.get("fiftyTwoWeekHigh"),
+        fifty_two_wk_low=info.get("fiftyTwoWeekLow"),
+        volume=info.get("volume"),
+        avg_volume=info.get("averageVolume"),
+        trailing_pe=info.get("trailingPE"),
+        forward_pe=info.get("forwardPE"),
+        eps=info.get("trailingEps"),
+        dividend_yield=info.get("dividendYield"),
+        next_earnings=next_earnings,
+        ex_dividend_date=ex_dividend_date,
+        sector=info.get("sector"),
+        industry=info.get("industry"),
+        country=info.get("country"),
+        website=info.get("website"),
+    )
+
+@app.get(
+    "/trending",
+    response_model=List[TrendingTicker],
+    summary="Get top trending tickers (region-specific only, FMP fallback)",
+)
+def get_trending(
+    count:  int    = Query(10, ge=1, le=20),
+    region: str    = Query("US", min_length=2, max_length=3),
+):
+    region_code = region.upper()
+
+    def fetch_symbols(url: str, params: dict) -> List[str]:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        r = requests.get(url, params=params, headers=headers, timeout=5)
+        r.raise_for_status()
+        results = r.json().get("finance", {}).get("result", [])
+        if not results or not results[0].get("quotes"):
+            raise ValueError("no-quotes")
+        return [q["symbol"] for q in results[0]["quotes"]]
+
+    symbols: List[str] = []
+
+    # 1) Only use Yahoo for US region
+    if region_code == "US":
+        TREND_URL = f"https://query2.finance.yahoo.com/v1/finance/trending/{region_code}"
+        SCREENER  = "https://query2.finance.yahoo.com/v1/finance/screener/predefined/saved"
+
+        # Try Trending
+        try:
+            symbols = fetch_symbols(
+                TREND_URL,
+                {"formatted":"false","lang":"en-US","region":region_code,"count":count,"corsDomain":"finance.yahoo.com"}
+            )
+        except Exception:
+            # Try Day Gainers
+            try:
+                symbols = fetch_symbols(
+                    SCREENER,
+                    {"formatted":"false","lang":"en-US","region":region_code,"count":count,"corsDomain":"finance.yahoo.com","scrIds":"day_gainers"}
+                )
+            except Exception:
+                # Try Most Actives
+                try:
+                    symbols = fetch_symbols(
+                        SCREENER,
+                        {"formatted":"false","lang":"en-US","region":region_code,"count":count,"corsDomain":"finance.yahoo.com","scrIds":"most_actives"}
+                    )
+                except Exception:
+                    symbols = []
+
+    # 2) Fallback to FMP for any region without symbols
+    if not symbols:
+        exch = FMP_EXCHANGE.get(region_code, "NASDAQ")
+        fmp_url    = "https://financialmodelingprep.com/api/v3/stock-screener"
+        fmp_params = {
+            "exchange": exch,
+            "limit":    count,
+            "apikey":   FMP_API_KEY,
+            "sort":     "changesPercentage",
+            "order":    "desc",
+        }
+        resp = requests.get(fmp_url, params=fmp_params, timeout=5)
+        if not resp.ok:
+            raise HTTPException(502, f"FMP fallback failed ({resp.status_code})")
+        data = resp.json()
+        symbols = [item["symbol"] for item in data]
+
+    if not symbols:
+        raise HTTPException(502, f"No trending/gainers for region '{region_code}'")
+
+    # 3) Populate details via get_current_price()
+    out: List[TrendingTicker] = []
+    for sym in symbols:
+        try:
+            pr = get_current_price(symbol=sym)
+            out.append(TrendingTicker(
+                symbol=   pr.symbol,
+                name=     pr.name,
+                logo_url= pr.logo_url,
+                price=    pr.price,
+            ))
+        except HTTPException:
+            out.append(TrendingTicker(symbol=sym, name=None, logo_url=None, price=None))
+
+    return out
+
+@app.get("/history", response_model=List[HistoricalDataPoint])
+def get_historical_data(
+    symbol: str,
+    range: str = Query("1mo", description="Data range, e.g. 1d, 5d, 1mo, 1y")
+):
     ticker = yf.Ticker(symbol)
     data = ticker.history(period=range)
     if data.empty:
@@ -87,7 +296,8 @@ def get_historical_data(symbol: str, range: str = Query("1mo", description="Data
             low=row["Low"],
             close=row["Close"],
             volume=row["Volume"]
-        ) for idx, row in data.iterrows()
+        )
+        for idx, row in data.iterrows()
     ]
 
 @app.get("/moving-average", response_model=MovingAverageResponse, summary="Get moving average")
@@ -121,15 +331,16 @@ async def websocket_price(websocket: WebSocket, symbol: str):
         while True:
             data = ticker.history(period="1d").tail(1).iloc[-1]
             payload = {
-                "price": data["Close"],
-                "high": data["High"],
-                "low": data["Low"],
-                "timestamp": str(data.name)
+                "price":     data["Close"],
+                "high":      data["High"],
+                "low":       data["Low"],
+                "timestamp": str(data.name),
             }
             await websocket.send_json(payload)
             await asyncio.sleep(5)
     except WebSocketDisconnect:
         pass
+
 def check_alerts():
     print("[AlertChecker] Checking alerts...")
     for alert in alerts_db:
